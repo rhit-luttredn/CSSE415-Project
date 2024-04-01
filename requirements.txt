@@ -1,0 +1,6 @@
+gymnasium==0.29.1
+numpy==1.26.4
+scikit_learn==1.4.1.post1
+torch==2.2.1
+tyro==0.7.3
+wandb==0.16.4
