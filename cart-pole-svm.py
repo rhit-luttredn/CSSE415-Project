@@ -13,6 +13,12 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+# from sklearn.svm import LinearSVC, LinearSVR
+# https://stackoverflow.com/questions/23056460/does-the-svm-in-sklearn-support-incremental-online-learning
+from sklearn.linear_model import SGDClassifier, SGDRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
 
 
 @dataclass
@@ -98,32 +104,60 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class Agent(nn.Module):
-    def __init__(self, envs):
+class Agent():
+    """
+    SVM-based PPO Agent for CartPole
+    """
+    def __init__(self):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
-        )
+        self.scaler = StandardScaler()
+        # SVM
+        # TODO: Make sure this is right
+        # self.critic = SGDRegressor(loss='epsilon_insensitive', penalty='l2', alpha=0.0001, epsilon=0.1)
+        # self.actor = SGDClassifier(loss='hinge', penalty='l2', alpha=0.0001, epsilon=0.1)
+
+        # Linear/Logistic Regressor
+        # TODO: Make sure this is right
+        # Using these for now, see note in get_action_and_value
+        self.critic = SGDRegressor(loss='squared_loss', penalty=None, alpha=0.0001)
+        self.actor = SGDClassifier(loss='log_loss', alpha=0.0001, epsilon=0.1)
+
+    def _scale_velocity(self, X):
+        # Apply tanh to cart velocity and pole angular velocity
+        # TODO: I added this to scale the infinite values, but I'm not sure if this is the right way to do it
+        # I wanted to just sigmoid it, but StandardScaler might work better
+        X[:, 1] = np.tanh(X[:, 1])
+        X[:, 3] = np.tanh(X[:, 3])
+        return X
+    
+    def fit(self, X, y):
+        X = self._scale_velocity(X)
+        self.scaler.fit(X)
+        X = self.scaler.transform(X)
+        self.critic.fit(X, y)
+        self.actor.fit(X, y > 0)
+
+    def partial_fit(self, X, y):
+        # Partial fit is what you call to iteratively train the model (idk if you need to fit first)
+        X = self._scale_velocity(X)
+        X = self.scaler.transform(X)
+        self.critic.partial_fit(X, y)
+        self.actor.partial_fit(X, y > 0)
 
     def get_value(self, x):
-        return self.critic(x)
+        # TODO: I think this is fine, might need to throw this into a tensor (see get_action_and_value for reason)
+        return self.critic.predict(x)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        # TODO: This only works for the linear/logistic regressors. SVMs dont support predict_proba so we will have to use the decision_function somehow
+        logits = self.actor.predict_proba(x)
+
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
+
+        # TODO: It might be easier to throw all this into torch tensors since the training code expects them to be tensors
+        # torch.from_numpy(action)
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
 
@@ -165,8 +199,9 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    # TODO: This is a change I made
+    agent = Agent()
+    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -185,10 +220,11 @@ if __name__ == "__main__":
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+        # TODO: For now I'm just going to leave this out since I dont know how to anneal the learning rate for the SGD models
+        # if args.anneal_lr:
+        #     frac = 1.0 - (iteration - 1.0) / args.num_iterations
+        #     lrnow = frac * args.learning_rate
+        #     # optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -285,10 +321,14 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                # TODO: update model, think this is right. But I also never call fit on the model so I'm not sure
+                agent.partial_fit(b_obs[mb_inds].cpu().numpy(), b_returns[mb_inds].cpu().numpy())
+
+                # TODO: I believe we need to leave this out since we arent using a neural network
+                # optimizer.zero_grad()
+                # loss.backward()
+                # nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                # optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -298,7 +338,8 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        # TODO: I left this out since we arent annealing the learning rate anymore
+        # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
