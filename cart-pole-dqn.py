@@ -87,18 +87,24 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 # TODO: I got this from ChatGPT, it looks right but I haven't verified it with any outside source
+# https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html
+# https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDRegressor.html
 """
 SGDClassifier
     Logistic Regression
-        loss='log' (logistic regression)
+        loss='log'
+        a probabilistic classifier
     Linear Support Vector Machine (SVM)
-        loss='hinge' (standard SVM)
+        loss='hinge'
     SVM with Squared Hinge Loss
         loss='squared_hinge'
+        like hinge but is quadratically penalized
     Perceptron
         loss='perceptron'
+        is the linear loss used by the perceptron algorithm
     Modified Huber Loss
         loss='modified_huber'
+        is another smooth loss that brings tolerance to outliers as well as probability estimates.
 SGDRegressor
     Linear Regression
         loss='squared_error' (no regularization)
@@ -118,7 +124,7 @@ model_to_args = {
     "svm_squared_hinge": {'loss': 'squared_hinge'},
     "perceptron": {'loss': 'perceptron'},
     "modified_huber": {'loss': 'modified_huber'},
-    "linear_regression": {'loss': 'squared_error'},
+    "linear_regression": {'loss': 'squared_error', 'penalty': None},
     "ridge_regression": {'loss': 'squared_error', 'penalty': 'l2'},
     "lasso_regression": {'loss': 'squared_error', 'penalty': 'l1'},
     "elastic_net_regression": {'loss': 'squared_error', 'penalty': 'elasticnet'},
@@ -134,7 +140,7 @@ class QNetwork():
         self.is_fit = False
         self.scaler = StandardScaler()
 
-        model = SGDRegressor(**model_to_args[model_type], alpha=0.0001)
+        model = SGDRegressor(**model_to_args[model_type], alpha=0.0001, learning_rate='constant', eta0=args.learning_rate)
 
         if self.num_actions == 1:
             self.network = model
