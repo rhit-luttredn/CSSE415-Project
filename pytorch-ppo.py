@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
 import os
 import random
@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 
 import gymnasium as gym
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,12 +14,6 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-# from sklearn.svm import LinearSVC, LinearSVR
-# https://stackoverflow.com/questions/23056460/does-the-svm-in-sklearn-support-incremental-online-learning
-from sklearn.linear_model import SGDClassifier, SGDRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-
 
 
 @dataclass
@@ -31,21 +26,27 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "reinforcement-learning"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = True
+    """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
+    # env_id: str = "MountainCar-v0"
+    # env_id: str = "Acrobot-v1"
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 500000
+    # total_timesteps: int = 500000
+    total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    # learning_rate: float = 2.5e-4
+    learning_rate: float = 0.01
     """the learning rate of the optimizer"""
     num_envs: int = 4
     """the number of parallel game environments"""
@@ -75,6 +76,10 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    regularization: str|None = None
+    """l1 for Lasso Regression, l2 for Ridge Regression, None for no regularization"""
+    alpha: float = 0.01
+    """the regularization strength"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -104,60 +109,47 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class Agent():
-    """
-    SVM-based PPO Agent for CartPole
-    """
-    def __init__(self):
+class LinearRegressor(nn.Module):
+    def __init__(self, n_features):
+        super(LinearRegressor, self).__init__()
+        # Initialize parameters: weight vector and bias
+        self.weight = nn.Parameter(torch.randn(n_features))
+        self.bias = nn.Parameter(torch.randn(1))
+
+    def forward(self, x):
+        # Linear prediction function
+        return torch.matmul(x, self.weight) + self.bias
+
+
+class LogisticRegressor(nn.Module):
+    def __init__(self, n_features, n_classes):
+        super(LogisticRegressor, self).__init__()
+        # Initialize parameters: weight matrix and bias
+        self.weight = nn.Parameter(torch.randn(n_classes, n_features))
+        self.bias = nn.Parameter(torch.randn(n_classes))
+
+    def forward(self, x):
+        # Linear combination (note the order in matmul: (classes, features) x (features, samples))
+        linear = torch.matmul(x, self.weight.t()) + self.bias
+        # Softmax activation function to output probabilities
+        return torch.softmax(linear, dim=1)
+
+
+class Agent(nn.Module):
+    def __init__(self, envs: gym.vector.VectorEnv):
         super().__init__()
-        self.scaler = StandardScaler()
-        # SVM
-        # TODO: Make sure this is right
-        # self.critic = SGDRegressor(loss='epsilon_insensitive', penalty='l2', alpha=0.0001, epsilon=0.1)
-        # self.actor = SGDClassifier(loss='hinge', penalty='l2', alpha=0.0001, epsilon=0.1)
-
-        # Linear/Logistic Regressor
-        # TODO: Make sure this is right
-        # Using these for now, see note in get_action_and_value
-        self.critic = SGDRegressor(loss='squared_loss', penalty=None, alpha=0.0001)
-        self.actor = SGDClassifier(loss='log_loss', alpha=0.0001, epsilon=0.1)
-
-    def _scale_velocity(self, X):
-        # Apply tanh to cart velocity and pole angular velocity
-        # TODO: I added this to scale the infinite values, but I'm not sure if this is the right way to do it
-        # I wanted to just sigmoid it, but StandardScaler might work better
-        X[:, 1] = np.tanh(X[:, 1])
-        X[:, 3] = np.tanh(X[:, 3])
-        return X
-    
-    def fit(self, X, y):
-        X = self._scale_velocity(X)
-        self.scaler.fit(X)
-        X = self.scaler.transform(X)
-        self.critic.fit(X, y)
-        self.actor.fit(X, y > 0)
-
-    def partial_fit(self, X, y):
-        # Partial fit is what you call to iteratively train the model (idk if you need to fit first)
-        X = self._scale_velocity(X)
-        X = self.scaler.transform(X)
-        self.critic.partial_fit(X, y)
-        self.actor.partial_fit(X, y > 0)
+        self.critic = LinearRegressor(envs.single_observation_space.shape[0])
+        self.actor = LogisticRegressor(envs.single_observation_space.shape[0], envs.single_action_space.n)
 
     def get_value(self, x):
-        # TODO: I think this is fine, might need to throw this into a tensor (see get_action_and_value for reason)
-        return self.critic.predict(x)
+        return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        # TODO: This only works for the linear/logistic regressors. SVMs dont support predict_proba so we will have to use the decision_function somehow
-        logits = self.actor.predict_proba(x)
-
+        logits = self.actor(x)
         probs = Categorical(logits=logits)
+        # probs = Categorical(probs=logits)
         if action is None:
             action = probs.sample()
-
-        # TODO: It might be easier to throw all this into torch tensors since the training code expects them to be tensors
-        # torch.from_numpy(action)
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
 
 
@@ -179,7 +171,7 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(f"runs/{args.exp_name}/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -195,13 +187,27 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, f"{args.exp_name}/{run_name}") for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    # TODO: This is a change I made
-    agent = Agent()
-    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    agent = Agent(envs).to(device)
+    optimizer = optim.SGD(agent.parameters(), lr=args.learning_rate)
+
+    print(list(agent.parameters()))
+    # tensor([0.6614, 0.2669, 0.0617, 0.6213], requires_grad=True), Parameter containing:
+    # tensor([-0.4519], requires_grad=True), Parameter containing:
+    # tensor([[-0.1661, -1.5228,  0.3817, -1.0276],
+    #         [-0.5631, -0.8923, -0.0583, -0.1955]], requires_grad=True), Parameter containing:
+    # tensor([-0.9656,  0.4224], requires_grad=True)]
+
+    # Trained:
+    # [Parameter containing:
+    # tensor([-0.4024,  0.7960,  1.0301,  0.4391], requires_grad=True), Parameter containing:
+    # tensor([26.1869], requires_grad=True), Parameter containing:
+    # tensor([[-0.1215, -1.3315,  0.1333, -2.0742],
+    #         [-0.6076, -1.0836,  0.1902,  0.8511]], requires_grad=True), Parameter containing:
+    # tensor([-0.2683, -0.2749], requires_grad=True)]
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -218,13 +224,15 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
+    obs_means = None
+    obs_stds = None
+
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
-        # TODO: For now I'm just going to leave this out since I dont know how to anneal the learning rate for the SGD models
-        # if args.anneal_lr:
-        #     frac = 1.0 - (iteration - 1.0) / args.num_iterations
-        #     lrnow = frac * args.learning_rate
-        #     # optimizer.param_groups[0]["lr"] = lrnow
+        if args.anneal_lr:
+            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            lrnow = frac * args.learning_rate
+            optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -284,6 +292,17 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
+                # TODO: Scale Observation Data
+                # The mean and std are moving as the agent learns. Idk what to do about this
+                # if obs_means is None and obs_stds is None:
+                #     obs_means = b_obs[mb_inds].mean(dim=0)
+                #     obs_stds = b_obs[mb_inds].std(dim=0)
+                
+                # obs_scaled = (b_obs[mb_inds] - obs_means) / (obs_stds + 1e-8)
+                # if torch.any(torch.abs(b_obs[mb_inds]) > 2):
+                #     print(f"{obs_means}, {obs_stds}")
+                #     print("b_obs[mb_inds] > 2", np.round(b_obs[mb_inds].cpu().numpy(), 2))
+
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -318,17 +337,20 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
+                if args.regularization == "l1":
+                    reg_loss = sum(param.abs().sum() for param in agent.parameters())
+                if args.regularization == "l2":
+                    reg_loss = sum(param.pow(2.0).sum() for param in agent.parameters())
+                if args.regularization is None:
+                    reg_loss = 0
+
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + reg_loss
 
-                # TODO: update model, think this is right. But I also never call fit on the model so I'm not sure
-                agent.partial_fit(b_obs[mb_inds].cpu().numpy(), b_returns[mb_inds].cpu().numpy())
-
-                # TODO: I believe we need to leave this out since we arent using a neural network
-                # optimizer.zero_grad()
-                # loss.backward()
-                # nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                # optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -338,8 +360,7 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        # TODO: I left this out since we arent annealing the learning rate anymore
-        # writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -349,6 +370,34 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    print(list(agent.parameters()))
+    
+    agent.eval()
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, f"{args.exp_name}/{run_name}-eval") for i in range(args.num_envs)],
+    )
+    eval_episodes = 10
+    obs, _ = envs.reset()
+    episodic_returns = []
+    while len(episodic_returns) < eval_episodes:
+        actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
+        next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if not info or "episode" not in info:
+                    continue
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+                episodic_returns += [info["episode"]["r"]]
+        obs = next_obs
+
+    if args.save_model:
+        model_path = f"runs/{args.exp_name}/{run_name}/{args.exp_name}.cleanrl_model"
+        torch.save(agent.state_dict(), model_path)
+        print(f"model saved to {model_path}")
+
+        for idx, episodic_return in enumerate(episodic_returns):
+            writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
     envs.close()
     writer.close()
