@@ -4,6 +4,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from itertools import combinations_with_replacement
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -14,6 +15,8 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+
+from linear_models import *
 
 
 @dataclass
@@ -26,7 +29,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "reinforcement-learning"
     """the wandb's project name"""
@@ -38,14 +41,10 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    # env_id: str = "MountainCar-v0"
-    # env_id: str = "Acrobot-v1"
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    # total_timesteps: int = 500000
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    # learning_rate: float = 2.5e-4
     learning_rate: float = 0.01
     """the learning rate of the optimizer"""
     num_envs: int = 4
@@ -78,8 +77,10 @@ class Args:
     """the target KL divergence threshold"""
     regularization: str|None = None
     """l1 for Lasso Regression, l2 for Ridge Regression, None for no regularization"""
-    alpha: float = 0.01
+    alpha: float = 0.001
     """the regularization strength"""
+    standardize: bool = False
+    """Toggles whether or not to standardize the observations"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -109,37 +110,13 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class LinearRegressor(nn.Module):
-    def __init__(self, n_features):
-        super(LinearRegressor, self).__init__()
-        # Initialize parameters: weight vector and bias
-        self.weight = nn.Parameter(torch.randn(n_features))
-        self.bias = nn.Parameter(torch.randn(1))
-
-    def forward(self, x):
-        # Linear prediction function
-        return torch.matmul(x, self.weight) + self.bias
-
-
-class LogisticRegressor(nn.Module):
-    def __init__(self, n_features, n_classes):
-        super(LogisticRegressor, self).__init__()
-        # Initialize parameters: weight matrix and bias
-        self.weight = nn.Parameter(torch.randn(n_classes, n_features))
-        self.bias = nn.Parameter(torch.randn(n_classes))
-
-    def forward(self, x):
-        # Linear combination (note the order in matmul: (classes, features) x (features, samples))
-        linear = torch.matmul(x, self.weight.t()) + self.bias
-        # Softmax activation function to output probabilities
-        return torch.softmax(linear, dim=1)
-
-
 class Agent(nn.Module):
-    def __init__(self, envs: gym.vector.VectorEnv):
+    def __init__(self, envs: gym.vector.VectorEnv, args: Args):
         super().__init__()
-        self.critic = LinearRegressor(envs.single_observation_space.shape[0])
-        self.actor = LogisticRegressor(envs.single_observation_space.shape[0], envs.single_action_space.n)
+        self._regularization = args.regularization
+        self._degree = args.features_degree
+        self.critic = LinearRegressor(envs.single_observation_space.shape[0], standardize=args.standardize)
+        self.actor = LogisticRegressor(envs.single_observation_space.shape[0], envs.single_action_space.n, standardize=args.standardize)
 
     def get_value(self, x):
         return self.critic(x)
@@ -147,10 +124,16 @@ class Agent(nn.Module):
     def get_action_and_value(self, x, action=None):
         logits = self.actor(x)
         probs = Categorical(logits=logits)
-        # probs = Categorical(probs=logits)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+
+    def regularization_loss(self):
+        if self._regularization == "l1":
+            return args.alpha * (torch.sum(torch.abs(self.critic.weight)) + torch.sum(torch.abs(self.actor.weight)))
+        if self._regularization == "l2":
+            return args.alpha * (torch.sum(torch.pow(self.critic.weight, 2)) + torch.sum(torch.pow(self.actor.weight, 2)))
+        return 0
 
 
 if __name__ == "__main__":
@@ -191,23 +174,8 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
-    optimizer = optim.SGD(agent.parameters(), lr=args.learning_rate)
-
-    print(list(agent.parameters()))
-    # tensor([0.6614, 0.2669, 0.0617, 0.6213], requires_grad=True), Parameter containing:
-    # tensor([-0.4519], requires_grad=True), Parameter containing:
-    # tensor([[-0.1661, -1.5228,  0.3817, -1.0276],
-    #         [-0.5631, -0.8923, -0.0583, -0.1955]], requires_grad=True), Parameter containing:
-    # tensor([-0.9656,  0.4224], requires_grad=True)]
-
-    # Trained:
-    # [Parameter containing:
-    # tensor([-0.4024,  0.7960,  1.0301,  0.4391], requires_grad=True), Parameter containing:
-    # tensor([26.1869], requires_grad=True), Parameter containing:
-    # tensor([[-0.1215, -1.3315,  0.1333, -2.0742],
-    #         [-0.6076, -1.0836,  0.1902,  0.8511]], requires_grad=True), Parameter containing:
-    # tensor([-0.2683, -0.2749], requires_grad=True)]
+    agent = Agent(envs, args).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -223,9 +191,6 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-
-    obs_means = None
-    obs_stds = None
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -292,17 +257,6 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                # TODO: Scale Observation Data
-                # The mean and std are moving as the agent learns. Idk what to do about this
-                # if obs_means is None and obs_stds is None:
-                #     obs_means = b_obs[mb_inds].mean(dim=0)
-                #     obs_stds = b_obs[mb_inds].std(dim=0)
-                
-                # obs_scaled = (b_obs[mb_inds] - obs_means) / (obs_stds + 1e-8)
-                # if torch.any(torch.abs(b_obs[mb_inds]) > 2):
-                #     print(f"{obs_means}, {obs_stds}")
-                #     print("b_obs[mb_inds] > 2", np.round(b_obs[mb_inds].cpu().numpy(), 2))
-
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -337,13 +291,7 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                if args.regularization == "l1":
-                    reg_loss = sum(param.abs().sum() for param in agent.parameters())
-                if args.regularization == "l2":
-                    reg_loss = sum(param.pow(2.0).sum() for param in agent.parameters())
-                if args.regularization is None:
-                    reg_loss = 0
-
+                reg_loss = agent.regularization_loss()
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + reg_loss
 
@@ -371,8 +319,6 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    print(list(agent.parameters()))
-    
     agent.eval()
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, f"{args.exp_name}/{run_name}-eval") for i in range(args.num_envs)],

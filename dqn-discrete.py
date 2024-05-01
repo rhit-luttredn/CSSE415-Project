@@ -3,9 +3,7 @@
 import os
 import random
 import time
-from copy import deepcopy
 from dataclasses import dataclass
-from joblib import dump
 
 import gymnasium as gym
 import numpy as np
@@ -15,11 +13,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
-from sklearn.linear_model import SGDClassifier, SGDRegressor
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
 from torch.utils.tensorboard import SummaryWriter
+
+from linear_models import *
+
 
 @dataclass
 class Args:
@@ -27,23 +24,25 @@ class Args:
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
-    track: bool = False
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "reinforcement-learning"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = 'sad-nns'
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = True
-    """whether to save model into the `runs/{args.exp_name}/{run_name}` folder"""
-    model_type: str = "linear_regression"
-    """the type of the model"""
+    """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
     """the id of the environment"""
-    total_timesteps: int = 300_000
+    total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
@@ -57,7 +56,7 @@ class Args:
     """the target network update rate"""
     target_network_frequency: int = 500
     """the timesteps it takes to update the target network"""
-    batch_size: int = 512
+    batch_size: int = 128
     """the batch size of sample from the reply memory"""
     start_e: float = 1
     """the starting epsilon for exploration"""
@@ -86,82 +85,14 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     return thunk
 
 
-# TODO: I got this from ChatGPT, it looks right but I haven't verified it with any outside source
-# https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html
-# https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDRegressor.html
-"""
-SGDClassifier
-    Logistic Regression
-        loss='log'
-        a probabilistic classifier
-    Linear Support Vector Machine (SVM)
-        loss='hinge'
-    SVM with Squared Hinge Loss
-        loss='squared_hinge'
-        like hinge but is quadratically penalized
-    Perceptron
-        loss='perceptron'
-        is the linear loss used by the perceptron algorithm
-    Modified Huber Loss
-        loss='modified_huber'
-        is another smooth loss that brings tolerance to outliers as well as probability estimates.
-SGDRegressor
-    Linear Regression
-        loss='squared_error' (no regularization)
-    Ridge Regression
-        loss='squared_error' and penalty='l2'
-    Lasso Regression
-        loss='squared_error' and penalty='l1'
-    Elastic Net Regression
-        loss='squared_error' and penalty='elasticnet'
-    Huber Regression
-        loss='huber' (more robust to outliers)
-"""
-
-model_to_args = {
-    "logistic_regression": {'loss': 'log'},
-    "svm": {'loss': 'hinge'},
-    "svm_squared_hinge": {'loss': 'squared_hinge'},
-    "perceptron": {'loss': 'perceptron'},
-    "modified_huber": {'loss': 'modified_huber'},
-    "linear_regression": {'loss': 'squared_error', 'penalty': None},
-    "ridge_regression": {'loss': 'squared_error', 'penalty': 'l2'},
-    "lasso_regression": {'loss': 'squared_error', 'penalty': 'l1'},
-    "elastic_net_regression": {'loss': 'squared_error', 'penalty': 'elasticnet'},
-    "huber_regression": {'loss': 'huber'},
-}
-
-
 # ALGO LOGIC: initialize agent here:
-class QNetwork():
-    def __init__(self, envs, model_type='linear_regression'):
+class QNetwork(nn.Module):
+    def __init__(self, env: gym.vector.VectorEnv):
         super().__init__()
-        self.num_actions = envs.single_action_space.n
-        self.is_fit = False
-        self.scaler = StandardScaler()
+        self.network = LinearRegressor(np.prod(env.single_observation_space.shape), env.single_action_space.n)
 
-        model = SGDRegressor(**model_to_args[model_type], alpha=0.0001, learning_rate='constant', eta0=args.learning_rate)
-
-        if self.num_actions == 1:
-            self.network = model
-        else:
-            self.network = MultiOutputRegressor(
-                model,
-                # n_jobs=-1
-            )
-
-    def partial_fit(self, X, y):
-        if not self.is_fit:
-            self.scaler.fit(X)
-            self.is_fit = True
-        X = self.scaler.transform(X)
-        self.network.partial_fit(X, y)
-
-    def predict(self, x):
-        if not self.is_fit:
-            return torch.randn(x.shape[0], self.num_actions) * 0.01
-        pred = self.network.predict(self.scaler.transform(x))
-        return torch.from_numpy(pred)
+    def forward(self, x):
+        return self.network(x)
 
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -179,7 +110,6 @@ if __name__ == "__main__":
 poetry run pip install "stable_baselines3==2.0.0a1"
 """
         )
-    curr_usr = os.getlogin()
     args = tyro.cli(Args)
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -195,7 +125,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{curr_usr}/{args.exp_name}/{run_name}")
+    writer = SummaryWriter(f"runs/{args.exp_name}/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -205,23 +135,26 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, f"{curr_usr}/{args.exp_name}/{run_name}") for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, f"{args.exp_name}/{run_name}") for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = QNetwork(envs, args.model_type)
-    target_network = deepcopy(q_network)
+    q_network = QNetwork(envs).to(device)
+    optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
+    target_network = QNetwork(envs).to(device)
+    target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        device=device,
+        device,
         handle_timeout_termination=False,
     )
     start_time = time.time()
@@ -231,10 +164,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
-        if random.random() < epsilon or global_step < args.learning_starts:
+        if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            q_values = q_network.predict(obs)
+            q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -263,16 +196,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             if global_step % args.train_frequency == 0:
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    next_q_values = target_network.predict(data.next_observations)
-                    target_max, _ = next_q_values.max(dim=1)
+                    target_max, _ = target_network(data.next_observations).max(dim=1)
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-                    td_target = td_target.type(torch.float64)
-                current_action_values = q_network.predict(data.observations)
-                current_action_values = current_action_values.type(torch.float64)
-                old_val = current_action_values.gather(1, data.actions).squeeze()
+                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
                 loss = F.mse_loss(td_target, old_val)
-
-                current_action_values[np.arange(len(data.actions)), data.actions] = td_target.type(torch.float64)
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
@@ -281,16 +208,20 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                 # optimize the model
-                observations = data.observations.reshape(-1, data.observations.shape[-1])
-                q_network.partial_fit(data.observations, current_action_values)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
             # update target network
             if global_step % args.target_network_frequency == 0:
-                target_network = deepcopy(q_network)
+                for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
+                    target_network_param.data.copy_(
+                        args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
+                    )
 
     # Evaluate
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, True, f"{curr_usr}/{args.exp_name}/{run_name}-eval") for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, True, f"{args.exp_name}/{run_name}-eval") for i in range(args.num_envs)]
     )
     eval_episodes = 10
     epsilon = 0.05
@@ -300,7 +231,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            q_values = q_network.predict(obs)
+            q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
         next_obs, _, _, _, infos = envs.step(actions)
         if "final_info" in infos:
@@ -315,8 +246,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
     if args.save_model:
-        model_path = f"runs/{curr_usr}/{args.exp_name}/{run_name}/{args.model_type}.joblib"
-        dump(q_network, model_path)
+        model_path = f"runs/{args.exp_name}/{run_name}/model.joblib"
+        torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
 
     envs.close()
