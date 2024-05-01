@@ -114,7 +114,6 @@ class Agent(nn.Module):
     def __init__(self, envs: gym.vector.VectorEnv, args: Args):
         super().__init__()
         self._regularization = args.regularization
-        self._degree = args.features_degree
         self.critic = LinearRegressor(envs.single_observation_space.shape[0], standardize=args.standardize)
         self.actor = LogisticRegressor(envs.single_observation_space.shape[0], envs.single_action_space.n, standardize=args.standardize)
 
