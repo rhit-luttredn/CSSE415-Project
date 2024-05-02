@@ -12,6 +12,7 @@ import torch.optim as optim
 import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+from linear_models import MultiTargetLinearRegressor
 
 
 @dataclass
@@ -109,23 +110,11 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-class MultiTargetLinearRegressor(nn.Module):
-    def __init__(self, n_features, n_targets):
-        super(MultiTargetLinearRegressor, self).__init__()
-        # Initialize parameters: weight vector and bias
-        self.weight = nn.Parameter(torch.randn(n_features, n_targets))
-        self.bias = nn.Parameter(torch.randn(n_targets))
-
-    def forward(self, x):
-        # Linear prediction function
-        return torch.matmul(x, self.weight) + self.bias
-
-
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.critic = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], 1)
-        self.actor_mean = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], np.prod(envs.single_action_space.shape))
+        self.critic = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], 1, False)
+        self.actor_mean = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], np.prod(envs.single_action_space.shape), False)
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
