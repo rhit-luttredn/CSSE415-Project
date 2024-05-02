@@ -29,7 +29,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "reinforcement-learning"
     """the wandb's project name"""
@@ -81,6 +81,8 @@ class Args:
     """the regularization strength"""
     standardize: bool = False
     """Toggles whether or not to standardize the observations"""
+    feature_degree: int = 2
+    """the degree of the polynomial features"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -110,17 +112,49 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+def polynomial_features(data, degree):
+    num_samples, num_features = data.shape
+
+    # Store initial features
+    features = [data]
+
+    if degree >= 2:
+        # Iterate through each degree from 2 to the specified degree
+        for d in range(2, degree + 1):
+            # Generate combinations for the current degree
+            for indices in combinations_with_replacement(range(num_features), d):
+                # Compute the product for each combination
+                feature_product = torch.prod(data[:, indices], dim=1, keepdim=True)
+                features.append(feature_product)
+
+    # Concatenate all features along the second dimension (features dimension)
+    return torch.cat(features, dim=1)
+
+
 class Agent(nn.Module):
     def __init__(self, envs: gym.vector.VectorEnv, args: Args):
         super().__init__()
         self._regularization = args.regularization
-        self.critic = LinearRegressor(envs.single_observation_space.shape[0], standardize=args.standardize)
-        self.actor = LogisticRegressor(envs.single_observation_space.shape[0], envs.single_action_space.n, standardize=args.standardize)
+        self._degree = args.feature_degree
+
+        num_features = np.prod(envs.single_observation_space.shape)
+        if self._degree > 1:
+            # Calculate number of features for the polynomial features
+            num_features = sum([len(list(combinations_with_replacement(range(num_features), i))) for i in range(1, self._degree + 1)])
+
+        self.critic = LinearRegressor(num_features, standardize=args.standardize)
+        self.actor = LogisticRegressor(num_features, envs.single_action_space.n, standardize=args.standardize)
 
     def get_value(self, x):
+        if self._degree > 1:
+            x = polynomial_features(x, self._degree)
+
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
+        if self._degree > 1:
+            x = polynomial_features(x, self._degree)
+
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
