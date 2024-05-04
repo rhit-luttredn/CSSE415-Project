@@ -48,7 +48,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "MountainCarContinuous-v0" # continuous cartpole? O_o
+    env_id: str = "ContinuousCartPole" # continuous cartpole? O_o
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -93,8 +93,9 @@ class QNetwork(nn.Module):
     """Backend q-learning network"""
     def __init__(self, env: gym.vector.VectorEnv):
         super().__init__()
-        self.network = MultiTargetLinearRegressor(np.prod(env.observation_space.shape) + np.prod(env.action_space.shape),
-                                                  np.prod(env.action_space.shape))
+        self.network = MultiTargetLinearRegressor(
+            np.prod(env.observation_space.shape) + np.prod(env.action_space.shape),
+            np.prod(env.action_space.shape))
 
     def forward(self, x, a):
         """Propagate the model forward"""
@@ -127,6 +128,11 @@ if __name__ == "__main__":
 poetry run pip install "stable_baselines3==2.0.0a1"
 """
         )
+
+    gym.register(id="ContinuousCartPole",
+                 entry_point="continuous_cartpole:ContinuousCartPoleEnv",
+                 max_episode_steps=500,
+                 reward_threshold=475.0,)
 
     args = tyro.cli(Args)
     run = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
