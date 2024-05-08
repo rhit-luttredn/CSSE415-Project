@@ -5,6 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
+from typing import List
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -23,7 +24,7 @@ from linear_models import *
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 2
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -31,11 +32,11 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "reinforcement-learning"
+    wandb_project_name: str = "reinforcement-learning-scaling"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
@@ -47,7 +48,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 0.01
     """the learning rate of the optimizer"""
-    num_envs: int = 4
+    num_envs: int = 5
     """the number of parallel game environments"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -83,6 +84,8 @@ class Args:
     """Toggles whether or not to standardize the observations"""
     feature_degree: int = 2
     """the degree of the polynomial features"""
+    scale: bool = True
+    """Toggles whether or not to scale the observations"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -112,22 +115,22 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-def polynomial_features(data, degree):
-    num_samples, num_features = data.shape
-
-    # Store initial features
-    features = [data]
-
-    if degree >= 2:
-        # Iterate through each degree from 2 to the specified degree
-        for d in range(2, degree + 1):
-            # Generate combinations for the current degree
-            for indices in combinations_with_replacement(range(num_features), d):
-                # Compute the product for each combination
-                feature_product = torch.prod(data[:, indices], dim=1, keepdim=True)
-                features.append(feature_product)
-
-    # Concatenate all features along the second dimension (features dimension)
+def polynomial_features(x: torch.Tensor, degree:int):
+    """ Generate polynomial and interaction features for input tensor x up to a given degree. """
+    n_samples, n_features = x.shape
+    features = [x]
+    
+    # Iterative approach to generate terms
+    for d in range(2, degree + 1):
+        for i in range(n_features):
+            # Generate powers for individual features
+            power = x[:, i:i+1] ** d
+            features.append(power)
+            # Generate interaction terms
+            for j in range(i + 1, n_features):
+                for p in range(1, d):
+                    interaction = (x[:, i:i+1] ** p) * (x[:, j:j+1] ** (d - p))
+                    features.append(interaction)
     return torch.cat(features, dim=1)
 
 
@@ -136,6 +139,8 @@ class Agent(nn.Module):
         super().__init__()
         self._regularization = args.regularization
         self._degree = args.feature_degree
+        self._alpha = args.alpha
+        self._scale = args.scale
 
         num_features = np.prod(envs.single_observation_space.shape)
         if self._degree > 1:
@@ -144,28 +149,47 @@ class Agent(nn.Module):
 
         self.critic = LinearRegressor(num_features, standardize=args.standardize)
         self.actor = LogisticRegressor(num_features, envs.single_action_space.n, standardize=args.standardize)
+    
+    def scale(self, x):
+        if not self._scale:
+            return x
 
-    def get_value(self, x):
+        x[:, 0] = x[:, 0] / 2.4
+        x[:, 1] = torch.tanh(x[:, 1])
+        x[:, 2] = x[:, 2] / 0.2095
+        x[:, 3] = torch.tanh(x[:, 3])
+        return x
+
+    def get_value(self, x: torch.Tensor):
+        x = self.scale(x)
         if self._degree > 1:
             x = polynomial_features(x, self._degree)
 
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, x: torch.Tensor, action: torch.Tensor|None = None):
+        x = self.scale(x)
         if self._degree > 1:
             x = polynomial_features(x, self._degree)
 
         logits = self.actor(x)
-        probs = Categorical(logits=logits)
+        probs = torch.softmax(logits, dim=-1)
         if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+            action = torch.multinomial(probs, 1)
+
+        action = action.view(-1, 1)
+        log_probs = torch.log(probs).gather(1, action).squeeze(-1)
+        entropy = -(probs * torch.log(probs)).sum(-1)
+        return action.squeeze(-1), log_probs, entropy, self.critic(x)
+    
+    def forward(self, x):
+        return self.get_action_and_value(x, None)[0]
 
     def regularization_loss(self):
         if self._regularization == "l1":
-            return args.alpha * (torch.sum(torch.abs(self.critic.weight)) + torch.sum(torch.abs(self.actor.weight)))
+            return self._alpha * (torch.sum(torch.abs(self.critic.weight)) + torch.sum(torch.abs(self.actor.weight)))
         if self._regularization == "l2":
-            return args.alpha * (torch.sum(torch.pow(self.critic.weight, 2)) + torch.sum(torch.pow(self.actor.weight, 2)))
+            return self._alpha * (torch.sum(torch.pow(self.critic.weight, 2)) + torch.sum(torch.pow(self.actor.weight, 2)))
         return 0
 
 
@@ -371,8 +395,10 @@ if __name__ == "__main__":
         obs = next_obs
 
     if args.save_model:
-        model_path = f"runs/{args.exp_name}/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(agent.state_dict(), model_path)
+        model_path = f"runs/{args.exp_name}/{run_name}/{args.exp_name}.pt"
+        model_scripted = torch.jit.script(agent)
+        model_scripted.save(model_path)
+        
         print(f"model saved to {model_path}")
 
         for idx, episodic_return in enumerate(episodic_returns):

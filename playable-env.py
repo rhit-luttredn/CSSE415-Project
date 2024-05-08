@@ -1,4 +1,5 @@
 import gymnasium as gym
+import numpy as np
 from pynput import keyboard
 
 
@@ -10,7 +11,7 @@ env = gym.make(ENV_ID, render_mode="human")
 num_episodes = 5
 
 START = False
-DONE = False
+DONE = True
 CURR_ACTION = None
 EXIT = False
 def on_press(key):
@@ -42,7 +43,6 @@ def print_controls():
     print("====================================================")
     print()
 
-# with keyboard.Listener(on_press=on_press) as listener:
 with keyboard.Events() as events:
     print_controls()
     episode = 0
@@ -69,8 +69,9 @@ with keyboard.Events() as events:
                 print(f"You've done {truncation} truncations! Keep it up!")
 
             DONE = DONE or term
+
+        print(f"Episode {episode + 1}: Total Reward = {total_reward}")
         
-        if not EXIT:
-            print(f"Episode {episode + 1}: Total Reward = {total_reward}")
+    print("Exiting the game")
 
 env.close()
