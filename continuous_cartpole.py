@@ -175,11 +175,11 @@ class ContinuousCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         )
 
         if not terminated:
-            reward = math.pow(action[0], 2) * 0.1
+            reward = 1
         elif self.steps_beyond_terminated is None:
             # Pole just fell!
             self.steps_beyond_terminated = 0
-            reward = math.pow(action[0], 2) * 0.1
+            reward = 1
         else:
             if self.steps_beyond_terminated == 0:
                 logger.warn(
