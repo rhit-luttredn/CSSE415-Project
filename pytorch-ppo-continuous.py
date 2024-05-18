@@ -1,66 +1,65 @@
-#! /usr/bin/env python3
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import os
 import random
 import time
 from dataclasses import dataclass
-from itertools import combinations_with_replacement
-from typing import List
 
 import gymnasium as gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-
-from linear_models import *
+from linear_models import MultiTargetLinearRegressor
 
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 2
+    seed: int = 1
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "reinforcement-learning-scaling"
+    wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
-    wandb_entity: str = "rhit-tuttlr"
+    wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_f: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
+    upload_model: bool = False
+    """whether to upload the saved model to huggingface"""
+    hf_entity: str = ""
+    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
+    env_id: str = "MountainCarContinuous-v0"
     """the id of the environment"""
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 0.05
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 5
+    num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    gae_lambda: float = 0.99
+    gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
+    num_minibatches: int = 32
     """the number of mini-batches"""
-    update_epochs: int = 4
+    update_epochs: int = 10
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -68,7 +67,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -76,16 +75,6 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
-    regularization: str|None = None
-    """l1 for Lasso Regression, l2 for Ridge Regression, None for no regularization"""
-    alpha: float = 0.001
-    """the regularization strength"""
-    standardize: bool = False
-    """Toggles whether or not to standardize the observations"""
-    feature_degree: int = 2
-    """the degree of the polynomial features"""
-    scale: bool = True
-    """Toggles whether or not to scale the observations"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -96,14 +85,20 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
+def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.ClipAction(env)
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
 
     return thunk
@@ -115,82 +110,24 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-def polynomial_features(x: torch.Tensor, degree:int):
-    """ Generate polynomial and interaction features for input tensor x up to a given degree. """
-    n_samples, n_features = x.shape
-    features = [x]
-    
-    # Iterative approach to generate terms
-    for d in range(2, degree + 1):
-        for i in range(n_features):
-            # Generate powers for individual features
-            power = x[:, i:i+1] ** d
-            features.append(power)
-            # Generate interaction terms
-            for j in range(i + 1, n_features):
-                for p in range(1, d):
-                    interaction = (x[:, i:i+1] ** p) * (x[:, j:j+1] ** (d - p))
-                    features.append(interaction)
-    return torch.cat(features, dim=1)
-
-
 class Agent(nn.Module):
-    def __init__(self, envs: gym.vector.VectorEnv, args: Args):
+    def __init__(self, envs):
         super().__init__()
-        self._regularization = args.regularization
-        self._degree = args.feature_degree
-        self._alpha = args.alpha
-        self._scale = args.scale
+        self.critic = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], 1, False)
+        self.actor_mean = MultiTargetLinearRegressor(envs.single_observation_space.shape[0], np.prod(envs.single_action_space.shape), False)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
-        num_features = np.prod(envs.single_observation_space.shape)
-        if self._degree > 1:
-            # Calculate number of features for the polynomial features
-            num_features = sum([len(list(combinations_with_replacement(range(num_features), i))) for i in range(1, self._degree + 1)])
-
-        self.critic = LinearRegressor(num_features, standardize=args.standardize)
-        self.actor = LogisticRegressor(num_features, envs.single_action_space.n, standardize=args.standardize)
-    
-    def scale(self, x):
-        if not self._scale:
-            return x
-
-        x[:, 0] = x[:, 0] / 2.4
-        x[:, 1] = torch.tanh(x[:, 1])
-        x[:, 2] = x[:, 2] / 0.2095
-        x[:, 3] = torch.tanh(x[:, 3])
-        return x
-
-    def get_value(self, x: torch.Tensor):
-        x = self.scale(x)
-        if self._degree > 1:
-            x = polynomial_features(x, self._degree)
-
+    def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x: torch.Tensor, action: torch.Tensor|None = None):
-        x = self.scale(x)
-        if self._degree > 1:
-            x = polynomial_features(x, self._degree)
-
-        logits = self.actor(x)
-        probs = torch.softmax(logits, dim=-1)
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
         if action is None:
-            action = torch.multinomial(probs, 1)
-
-        action = action.view(-1, 1)
-        log_probs = torch.log(probs).gather(1, action).squeeze(-1)
-        entropy = -(probs * torch.log(probs)).sum(-1)
-        return action.squeeze(-1), log_probs, entropy, self.critic(x)
-    
-    def forward(self, x):
-        return self.get_action_and_value(x, None)[0]
-
-    def regularization_loss(self):
-        if self._regularization == "l1":
-            return self._alpha * (torch.sum(torch.abs(self.critic.weight)) + torch.sum(torch.abs(self.actor.weight)))
-        if self._regularization == "l2":
-            return self._alpha * (torch.sum(torch.pow(self.critic.weight, 2)) + torch.sum(torch.pow(self.actor.weight, 2)))
-        return 0
+            action = probs.sample()
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 
 if __name__ == "__main__":
@@ -211,7 +148,7 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{args.exp_name}/{run_name}")
+    writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -227,12 +164,12 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, f"{args.exp_name}/{run_name}") for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    agent = Agent(envs, args).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate)
+    agent = Agent(envs).to(device)
+    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -314,7 +251,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -348,9 +285,8 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                reg_loss = agent.regularization_loss()
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + reg_loss
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -395,10 +331,8 @@ if __name__ == "__main__":
         obs = next_obs
 
     if args.save_model:
-        model_path = f"runs/{args.exp_name}/{run_name}/{args.exp_name}.pt"
-        model_scripted = torch.jit.script(agent)
-        model_scripted.save(model_path)
-        
+        model_path = f"runs/{args.exp_name}/{run_name}/{args.exp_name}.cleanrl_model"
+        torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
 
         for idx, episodic_return in enumerate(episodic_returns):
