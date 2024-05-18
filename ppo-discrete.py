@@ -29,11 +29,11 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "reinforcement-learning"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "rhit-tuttlr"
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -45,7 +45,7 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    learning_rate: float = 0.01
+    learning_rate: float = 0.05
     """the learning rate of the optimizer"""
     num_envs: int = 4
     """the number of parallel game environments"""
@@ -55,7 +55,7 @@ class Args:
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.99
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 4
     """the number of mini-batches"""
